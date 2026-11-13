@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Vector Aid — in-vehicle alert</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --base:#0A1420; --panel:#12212F; --line:#1E3448;
+    --text:#DCE7F2; --muted:#6B8BA8;
+    --clear:#35D0A5; --warning:#FFB020; --critical:#FF4438;
+    --route:#4A9EFF;
+    --corridor-halo:#7C3AED; --corridor-glow:#A855F7; --corridor-core:#D8B4FE;
+    --state:var(--clear); --state-dim:rgba(53,208,165,.14);
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--base); color:var(--text);
+    font-family:"IBM Plex Sans",system-ui,sans-serif; -webkit-font-smoothing:antialiased; }
+  body[data-severity="WARNING"]  { --state:var(--warning);  --state-dim:rgba(255,176,32,.16); }
+  body[data-severity="CRITICAL"] { --state:var(--critical); --state-dim:rgba(255,68,56,.18); }
+
+  .shell { display:grid; grid-template-columns:minmax(340px,38%) 1fr; height:100%; }
+  .alert-side { display:flex; flex-direction:column; border-right:1px solid var(--line); min-width:0; }
+
+  .band { padding:26px 26px 22px; background:var(--state-dim);
+    border-bottom:1px solid var(--line); border-left:6px solid var(--state);
+    transition:background 240ms ease, border-color 240ms ease; }
+  .band h1 { margin:0; font-size:clamp(2rem,4.2vw,2.9rem); font-weight:700;
+    letter-spacing:-.02em; line-height:1; color:var(--state); }
+  .band p { margin:10px 0 0; font-size:1rem; line-height:1.45; max-width:34ch; }
+  @media (prefers-reduced-motion:no-preference) {
+    body[data-severity="CRITICAL"] .band { animation:breathe 1.1s ease-in-out infinite; }
+  }
+  @keyframes breathe { 0%,100%{background:var(--state-dim);} 50%{background:rgba(255,68,56,.30);} }
+
+  .readouts { display:grid; grid-template-columns:1fr 1fr; border-bottom:1px solid var(--line); }
+  .readout { padding:18px 26px; min-width:0; }
+  .readout + .readout { border-left:1px solid var(--line); }
+  .readout .value { font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+    font-size:2.1rem; font-weight:600; line-height:1; }
+  .readout .unit { font-size:.95rem; color:var(--muted); margin-left:3px; }
+  .readout .label { margin-top:6px; font-size:.8rem; color:var(--muted); }
+
+  .dial-wrap { display:flex; align-items:center; justify-content:center; padding:18px; }
+  .dial { width:min(230px,70%); aspect-ratio:1; }
+  .dial .ring { fill:none; stroke:var(--line); stroke-width:2; }
+  .dial .tick { stroke:var(--line); stroke-width:2; }
+  .dial .cardinal { fill:var(--muted); font-size:11px; text-anchor:middle; }
+  .dial .car { fill:none; stroke:var(--muted); stroke-width:2.5; stroke-linejoin:round; }
+  .dial .needle { fill:var(--state); transition:transform 320ms cubic-bezier(.34,.9,.3,1);
+    transform-origin:100px 100px; }
+  .dial .hub { fill:var(--base); stroke:var(--line); stroke-width:2; }
+  @media (prefers-reduced-motion:reduce) { .dial .needle { transition:none; } }
+  .dial-caption { text-align:center; padding:0 26px 16px; color:var(--muted); font-size:.88rem; }
+  .dial-caption strong { color:var(--text); font-weight:600; }
+
+  .rows { border-top:1px solid var(--line); padding:14px 26px 18px; }
+  .row { display:flex; justify-content:space-between; align-items:baseline;
+    padding:5px 0; font-size:.87rem; color:var(--muted); }
+  .row b { font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+    font-weight:500; color:var(--text); }
+  .rtitle { font-size:.72rem; letter-spacing:.14em; color:var(--muted); margin-bottom:6px; }
+
+  .btn { width:100%; margin-top:10px; padding:10px 14px; background:transparent;
+    border:1px solid var(--line); border-radius:4px; color:var(--text);
+    font-family:inherit; font-size:.88rem; cursor:pointer; }
+  .btn:hover { border-color:var(--corridor-glow); }
+  .btn:disabled { opacity:.4; cursor:default; }
+
+  .map-side { position:relative; min-width:0; overflow:hidden; }
+  #map { position:absolute; inset:0; background:var(--panel); }
+
+  /* ---- search, Google-Maps style ---- */
+  .search { position:absolute; top:14px; left:14px; z-index:800;
+    width:min(420px, calc(100% - 96px)); }
+  .search-bar { display:flex; align-items:center; gap:10px; height:48px;
+    padding:0 8px 0 16px; background:var(--base); border:1px solid var(--line);
+    border-radius:24px; box-shadow:0 2px 10px rgba(0,0,0,.45); }
+  .search-bar:focus-within { border-color:var(--route); }
+  .search-bar svg { flex:none; color:var(--muted); }
+  .search-bar input { flex:1; min-width:0; height:100%; background:transparent; border:0;
+    outline:0; color:var(--text); font:inherit; font-size:1rem; }
+  .search-bar input::placeholder { color:var(--muted); }
+  .search-bar input::-webkit-search-cancel-button { -webkit-appearance:none; display:none; }
+  .icon-btn { flex:none; width:36px; height:36px; display:grid; place-items:center;
+    background:transparent; border:0; border-radius:50%; color:var(--muted); cursor:pointer; }
+  .icon-btn:hover { background:rgba(255,255,255,.06); color:var(--text); }
+  .icon-btn[hidden] { display:none; }
+  .results { margin-top:6px; background:var(--base); border:1px solid var(--line);
+    border-radius:12px; overflow:hidden auto; max-height:52vh;
+    box-shadow:0 6px 20px rgba(0,0,0,.5); }
+  .results[hidden] { display:none; }
+  .result { display:grid; grid-template-columns:20px 1fr; gap:12px; align-items:center;
+    padding:10px 16px; cursor:pointer; }
+  .result + .result { border-top:1px solid var(--line); }
+  .result.active, .result:hover { background:rgba(74,158,255,.14); }
+  .result svg { color:var(--muted); }
+  .result .name { font-weight:600; font-size:.95rem; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
+  .result .detail { color:var(--muted); font-size:.8rem; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
+  .note { padding:10px 16px; color:var(--muted); font-size:.86rem; }
+  .note.error { color:var(--critical); }
+
+  /* ---- map controls, bottom right ---- */
+  .ctrls { position:absolute; right:14px; bottom:14px; z-index:800;
+    display:flex; flex-direction:column; gap:10px; align-items:center; }
+  .ctrl { width:44px; height:44px; display:grid; place-items:center; padding:0;
+    background:var(--base); border:1px solid var(--line); border-radius:50%;
+    color:var(--text); cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,.45); }
+  .ctrl:hover { border-color:var(--route); }
+  .zoom { display:flex; flex-direction:column; background:var(--base);
+    border:1px solid var(--line); border-radius:22px; overflow:hidden;
+    box-shadow:0 2px 8px rgba(0,0,0,.45); }
+  .zoom button { width:44px; height:40px; background:transparent; border:0;
+    color:var(--text); font-size:1.3rem; line-height:1; cursor:pointer; }
+  .zoom button + button { border-top:1px solid var(--line); }
+  .zoom button:hover { background:rgba(255,255,255,.06); }
+  .recenter { color:var(--muted); }
+  .recenter[aria-pressed="true"] { color:var(--route); border-color:var(--route); }
+  .compass { position:absolute; top:14px; right:14px; z-index:800; }
+  .compass svg { transition:transform 120ms linear; }
+  .compass[hidden] { display:none; }
+
+  .status { position:absolute; left:14px; right:72px; bottom:14px; z-index:500;
+    display:flex; flex-wrap:wrap; gap:8px 22px; padding:12px 16px;
+    background:rgba(10,20,32,.92); border:1px solid var(--line); border-radius:4px;
+    backdrop-filter:blur(6px); font-size:.83rem; color:var(--muted); }
+  .status span.on { color:var(--clear); } .status span.off { color:var(--critical); }
+  .status b { font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+    font-weight:500; color:var(--text); }
+
+  /* ---- markers ---- */
+  .veh svg { display:block; overflow:visible; filter:drop-shadow(0 2px 3px rgba(0,0,0,.55)); }
+  /* No heading yet (standing still, no IMU): the car can't show which way
+     it faces, so it is drawn faded and upright instead of guessing. */
+  .veh.no-heading { opacity:.6; }
+  .go-here { font:inherit; font-size:.85rem; padding:6px 12px; border:0; border-radius:14px;
+    background:var(--route); color:#fff; cursor:pointer; }
+
+  .leaflet-container { background:var(--panel); }
+  .leaflet-control-attribution { background:rgba(10,20,32,.8)!important; color:var(--muted)!important; }
+  .leaflet-control-attribution a { color:var(--muted)!important; }
+  .marker-label { background:var(--base); border:1px solid var(--state); color:var(--text);
+    padding:2px 7px; border-radius:3px; font-size:11px; font-weight:600; white-space:nowrap; }
+
+  /* Purple corridor beam - same flowing-dash treatment as the transmitter's
+     neon line, different hue so the two dashboards are tellable apart. */
+  .corridor-core { animation:flow 1s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset:-28; } }
+  @media (prefers-reduced-motion:reduce) { .corridor-core { animation:none; } }
+
+  :focus-visible { outline:2px solid var(--state); outline-offset:2px; }
+
+  @media (max-width:860px) {
+    .shell { grid-template-columns:1fr; grid-template-rows:auto 46vh; }
+    .alert-side { border-right:none; border-bottom:1px solid var(--line); }
+    .dial { width:170px; }
+  }
+</style>
+</head>
+<body data-severity="NONE">
+
+<div class="shell">
+  <section class="alert-side">
+    <div class="band">
+      <h1 id="severity">STANDBY</h1>
+      <p id="message">Waiting for an ambulance signal.</p>
+    </div>
+
+    <div class="readouts">
+      <div class="readout">
+        <div><span class="value" id="distance">--</span><span class="unit">m</span></div>
+        <div class="label">Distance to ambulance</div>
+      </div>
+      <div class="readout">
+        <div><span class="value" id="speed">--</span><span class="unit">km/h</span></div>
+        <div class="label">Ambulance speed</div>
+      </div>
+    </div>
+
+    <div class="dial-wrap">
+      <svg class="dial" viewBox="0 0 200 200" role="img"
+           aria-label="Direction of the ambulance relative to your vehicle">
+        <circle class="ring" cx="100" cy="100" r="86"/>
+        <g id="ticks"></g>
+        <text class="cardinal" x="100" y="26">front</text>
+        <text class="cardinal" x="100" y="182">rear</text>
+        <text class="cardinal" x="176" y="104">right</text>
+        <text class="cardinal" x="24" y="104">left</text>
+        <path class="car" d="M100 84 L110 116 L100 109 L90 116 Z"/>
+        <g class="needle" id="needle"><path d="M100 30 L108 52 L100 46 L92 52 Z"/></g>
+        <circle class="hub" cx="100" cy="100" r="7"/>
+      </svg>
+    </div>
+    <div class="dial-caption" id="dialCaption">No bearing yet</div>
+
+    <div class="rows">
+      <div class="rtitle">YOUR ROUTE</div>
+      <div class="row"><span>Remaining</span><b id="rkm">--</b></div>
+      <div class="row"><span>Time left</span><b id="rmin">--</b></div>
+      <button class="btn" id="clearbtn" disabled>Clear destination</button>
+    </div>
+
+    <div class="rows">
+      <div class="rtitle">ALTITUDE (MSL)</div>
+      <div class="row"><span>Ambulance</span><b id="ambalt">--</b></div>
+    </div>
+  </section>
+
+  <section class="map-side">
+    <div id="map"></div>
+
+    <div class="search" id="search">
+      <div class="search-bar">
+        <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M15.5 15.5L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <input id="q" type="search" placeholder="Search for a destination" autocomplete="off"
+               spellcheck="false" aria-label="Search for a destination"
+               aria-controls="results" aria-autocomplete="list">
+        <button class="icon-btn" id="qclear" type="button" aria-label="Clear search" hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div class="results" id="results" role="listbox" hidden></div>
+    </div>
+
+    <button class="ctrl compass" id="compass" type="button" title="Point north up" aria-label="Point north up" hidden>
+      <svg id="compassNeedle" width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><path d="M13 2l4.5 11h-9z" fill="#EA4335"/><path d="M13 24l-4.5-11h9z" fill="#DCE7F2"/></svg>
+    </button>
+
+    <div class="ctrls">
+      <div class="zoom">
+        <button type="button" id="zin" aria-label="Zoom in">+</button>
+        <button type="button" id="zout" aria-label="Zoom out">&minus;</button>
+      </div>
+      <button class="ctrl recenter" id="recenter" type="button" aria-pressed="true"
+              title="Re-centre on your vehicle" aria-label="Re-centre on your vehicle">
+        <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5l7 18-7-4-7 4z" fill="currentColor"/></svg>
+      </button>
+    </div>
+
+    <div class="status">
+      <div>Radio <span id="linkState" class="off">down</span> <b id="rxcount">0</b> rx</div>
+      <div>GPS <span id="gpsState" class="off">no fix</span> <b id="sats">0</b> sats</div>
+      <div>Heading <b id="heading">--</b>&deg; <span id="headingSrc">(none)</span></div>
+      <div>Off-path <b id="offset">--</b> m</div>
+      <div>Match <b id="mode">--</b></div>
+      <div>Corridor <b id="cpts">0</b> pts</div>
+      <div>Loss <b id="loss">0.0</b>%</div>
+    </div>
+  </section>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  /* ================================================================ dial */
+  var ticks = document.getElementById("ticks");
+  for (var a = 0; a < 360; a += 30) {
+    var rad = (a - 90) * Math.PI / 180;
+    var l = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    l.setAttribute("class", "tick");
+    l.setAttribute("x1", (100 + Math.cos(rad) * 78).toFixed(1));
+    l.setAttribute("y1", (100 + Math.sin(rad) * 78).toFixed(1));
+    l.setAttribute("x2", (100 + Math.cos(rad) * 86).toFixed(1));
+    l.setAttribute("y2", (100 + Math.sin(rad) * 86).toFixed(1));
+    ticks.appendChild(l);
+  }
+
+  /* ============================================================ helpers */
+  var R_EARTH = 6371008.8, DEG = Math.PI / 180;
+
+  function metres(a, b) {
+    var dp = (b[0] - a[0]) * DEG, dl = (b[1] - a[1]) * DEG;
+    var x = Math.sin(dp / 2) ** 2
+          + Math.cos(a[0] * DEG) * Math.cos(b[0] * DEG) * Math.sin(dl / 2) ** 2;
+    return 2 * R_EARTH * Math.asin(Math.min(1, Math.sqrt(x)));
+  }
+  function bearingDeg(lat1, lon1, lat2, lon2) {
+    var p1 = lat1 * DEG, p2 = lat2 * DEG, dl = (lon2 - lon1) * DEG;
+    var y = Math.sin(dl) * Math.cos(p2);
+    var x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return (Math.atan2(y, x) / DEG + 360) % 360;
+  }
+  function offsetPoint(lat, lon, brg, dist) {
+    var d = dist / R_EARTH, b = brg * DEG, p1 = lat * DEG, l1 = lon * DEG;
+    var p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(b));
+    var l2 = l1 + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(p1),
+                             Math.cos(d) - Math.sin(p1) * Math.sin(p2));
+    return [p2 / DEG, l2 / DEG];
+  }
+  function angDiff(a, b) { return ((a - b + 540) % 360) - 180; }   // a - b in (-180,180]
+  function wrap360(a) { return ((a % 360) + 360) % 360; }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c];
+    });
+  }
+
+  /* ================================================================ map */
+  var map = L.map("map", {
+    rotate: true, bearing: 0, touchRotate: false, shiftKeyRotate: false,
+    rotateControl: false, compassBearing: false,
+    zoomControl: false, zoomSnap: 0, zoomDelta: 0.5, wheelPxPerZoomLevel: 90
+  }).setView([13.0827, 80.2707], 15);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "&copy; OpenStreetMap contributors"
+  }).addTo(map);
+
+  var el = {};
+  ["severity","message","distance","speed","needle","dialCaption","linkState",
+   "gpsState","sats","heading","headingSrc","offset","mode","cpts","loss","rxcount",
+   "rkm","rmin","clearbtn","ambalt","q","qclear","results","recenter","compass",
+   "compassNeedle","zin","zout"].forEach(function (id) {
+    el[id] = document.getElementById(id);
+  });
+  ["search", "ctrls", "compass"].forEach(function (id) {
+    var node = document.getElementById(id) || document.querySelector("." + id);
+    if (node) { L.DomEvent.disableClickPropagation(node); L.DomEvent.disableScrollPropagation(node); }
+  });
+
+  var SEV = { NONE:"STANDBY", WARNING:"CAUTION", CRITICAL:"PULL OVER" };
+
+  // Top-view vehicles, drawn nose-up on a 40x40 grid in the same style as
+  // the transmitter's ambulance. Leaflet icons stay upright when the map
+  // rotates, so each one is turned by (its heading + map bearing) every frame.
+  var CAR_SVG = '<svg width="44" height="44" viewBox="0 0 40 40"><g class="rot">'
+    + '<ellipse cx="20" cy="20" rx="10" ry="16" fill="#4A9EFF" opacity=".22"/>'
+    + '<rect x="10.6" y="12.2" width="2.4" height="3.2" rx="1.1" fill="#2F6FD6"/>'       // mirrors
+    + '<rect x="27" y="12.2" width="2.4" height="3.2" rx="1.1" fill="#2F6FD6"/>'
+    + '<rect x="12.5" y="4.5" width="15" height="31" rx="5.5" fill="#3B82F6"'
+    +   ' stroke="#E8F1FF" stroke-width="1"/>'                                             // body
+    + '<path d="M14 11.8 Q20 9.6 26 11.8 L24.7 16 Q20 14.9 15.3 16 Z" fill="#0F1C2B"/>'  // windscreen
+    + '<rect x="15.3" y="16.8" width="9.4" height="9.2" rx="1.8" fill="#6FB0FF"/>'       // roof
+    + '<path d="M15.3 27 Q20 28.1 24.7 27 L25.6 30.6 Q20 32 14.4 30.6 Z" fill="#0F1C2B"/>' // rear glass
+    + '<rect x="13.7" y="5.3" width="3.4" height="1.9" rx=".9" fill="#FFF4C2"/>'         // headlights
+    + '<rect x="22.9" y="5.3" width="3.4" height="1.9" rx=".9" fill="#FFF4C2"/>'
+    + '<rect x="13.8" y="33" width="3" height="1.5" rx=".7" fill="#FF4438"/>'            // tail lights
+    + '<rect x="23.2" y="33" width="3" height="1.5" rx=".7" fill="#FF4438"/>'
+    + '</g></svg>';
+
+  // Identical to the transmitter dashboard's ambulance.
+  var AMB_SVG = '<svg width="44" height="44" viewBox="0 0 40 40"><g class="rot">'
+    + '<ellipse cx="20" cy="20" rx="9" ry="15" fill="#f85149" opacity=".22"/>'
+    + '<rect x="12" y="6" width="16" height="28" rx="3.5" fill="#f2f2f2" stroke="#c9d1d9" stroke-width=".8"/>'
+    + '<rect x="12" y="6" width="16" height="5.5" rx="2.5" fill="#2b3440"/>'
+    + '<rect x="12" y="28.5" width="16" height="5.5" rx="2.5" fill="#2b3440"/>'
+    + '<rect x="12" y="17" width="16" height="4" fill="#f85149"/>'
+    + '<rect x="18.6" y="13" width="2.8" height="12" fill="#f85149"/>'
+    + '<rect x="14" y="18.2" width="12" height="1.6" fill="#f85149"/>'
+    + '<circle cx="15" cy="4.6" r="2" fill="#f85149"/>'
+    + '<circle cx="25" cy="4.6" r="2" fill="#58a6ff"/>'
+    + '<path d="M20 1.5 L22.4 5 L17.6 5 Z" fill="#3fb950"/>'
+    + '</g></svg>';
+
+  var CAR_ICON = L.divIcon({ className:"", iconSize:[44,44], iconAnchor:[22,22],
+    html:'<div class="veh no-heading" id="carnav">' + CAR_SVG + '</div>' });
+  var AMB_ICON = L.divIcon({ className:"", iconSize:[44,44], iconAnchor:[22,22],
+    html:'<div class="veh" id="ambnav">' + AMB_SVG + '</div>' });
+
+  function turn(id, heading) {
+    var node = document.getElementById(id);
+    var rot = node && node.querySelector(".rot");
+    if (rot) rot.setAttribute("transform",
+      "rotate(" + wrap360(heading + map.getBearing()).toFixed(1) + " 20 20)");
+  }
+
+  var DEST_ICON = L.divIcon({ className:"", iconSize:[30,42], iconAnchor:[15,41],
+    html:'<svg width="30" height="42" viewBox="0 0 30 42" style="filter:drop-shadow(0 2px 3px rgba(0,0,0,.5))">'
+      + '<path d="M15 1C7.3 1 1 7.2 1 14.9 1 25.3 15 41 15 41s14-15.7 14-26.1C29 7.2 22.7 1 15 1z"'
+      + ' fill="#EA4335" stroke="#fff" stroke-width="2"/><circle cx="15" cy="15" r="5" fill="#7A1C14"/></svg>' });
+
+  function flag(node, ok, on, off) { node.textContent = ok ? on : off; node.className = ok ? "on" : "off"; }
+
+  /* ===================================================== layers & state */
+  var carMarker = null, ambMarker = null, destMarker = null, trail = null;
+  var routeLines = null, rayLine = null, corridorLayers = null, corridorVersion = null;
+  var trailPts = [];
+  var TRAIL_MAX = 200, TRAIL_MIN_M = 4;
+  var latest = null;                                   // last state frame
+
+  // camera
+  var cam = { follow: true, headingUp: true, zoom: 18, previewUntil: 0 };
+  var target = { lat: null, lon: null, heading: null };
+  var shown  = { lat: null, lon: null, heading: 0, hasHeading: false, zoom: 18 };
+  var programmatic = false;
+
+  function setFollow(on) {
+    cam.follow = on;
+    el.recenter.setAttribute("aria-pressed", on ? "true" : "false");
+  }
+
+  var userZooming = false;
+  map.on("dragstart", function () { setFollow(false); cam.previewUntil = 0; });
+  // Wheel or pinch zoom keeps you in follow mode (as in Google Maps); the
+  // camera just pauses until the zoom animation finishes, then adopts it.
+  map.on("zoomstart", function () { if (!programmatic) userZooming = true; });
+  map.on("zoomend", function () {
+    if (!programmatic) { cam.zoom = map.getZoom(); shown.zoom = cam.zoom; userZooming = false; }
+  });
+
+  el.recenter.addEventListener("click", function () {
+    cam.headingUp = true; cam.previewUntil = 0; setFollow(true);
+    if (cam.zoom < 16) cam.zoom = 18;
+  });
+  el.compass.addEventListener("click", function () {
+    cam.headingUp = false;
+    if (!cam.follow) { programmatic = true; map.setBearing(0); programmatic = false; }
+  });
+  el.zin.addEventListener("click", function () { zoomBy(+1); });
+  el.zout.addEventListener("click", function () { zoomBy(-1); });
+  function zoomBy(step) {
+    cam.zoom = Math.max(3, Math.min(19, (cam.follow ? cam.zoom : map.getZoom()) + step));
+    if (!cam.follow) map.setZoom(cam.zoom);
+  }
+
+  /* ============================================================ camera */
+  // Zoom used while following. During an alert it pulls out just far enough
+  // that the ambulance stays on screen, then returns to your chosen zoom.
+  function followZoom() {
+    var z = cam.zoom;
+    if (latest && latest.ambulance && latest.alert.severity !== "NONE" && shown.lat != null) {
+      var d = metres([shown.lat, shown.lon], [latest.ambulance.lat, latest.ambulance.lon]);
+      var size = map.getSize(), room = 0.38 * Math.min(size.x, size.y);
+      var fit = Math.log2(40075016.686 * Math.cos(shown.lat * DEG) * room / (256 * Math.max(d, 1)));
+      z = Math.max(13, Math.min(z, fit));
+    }
+    return z;
+  }
+
+  function applyCamera() {
+    var bearing = (cam.headingUp && shown.hasHeading) ? -shown.heading : 0;
+    if (Math.abs(angDiff(bearing, map.getBearing())) > 0.15) {
+      programmatic = true; map.setBearing(bearing); programmatic = false;
+    }
+
+    shown.zoom += (followZoom() - shown.zoom) * 0.2;
+    var size = map.getSize();
+    var mpp = 40075016.686 * Math.cos(shown.lat * DEG) / Math.pow(2, shown.zoom + 8);
+    var alerting = latest && latest.alert.severity !== "NONE";
+    // Heading-up puts the car in the lower part of the screen, like Google
+    // Maps, so you see more road ahead. During an alert it stays centred.
+    var ahead = (cam.headingUp && shown.hasHeading && !alerting) ? 0.22 * size.y * mpp : 0;
+    var c = ahead ? offsetPoint(shown.lat, shown.lon, shown.heading, ahead) : [shown.lat, shown.lon];
+
+    var cur = map.getCenter();
+    if (metres([cur.lat, cur.lng], c) > mpp * 0.4 || Math.abs(map.getZoom() - shown.zoom) > 0.01) {
+      programmatic = true; map.setView(c, shown.zoom, { animate: false }); programmatic = false;
+    }
+  }
+
+  function tick() {
+    if (target.lat == null) return;
+    if (shown.lat == null || metres([shown.lat, shown.lon], [target.lat, target.lon]) > 60) {
+      shown.lat = target.lat; shown.lon = target.lon;           // first fix or a jump
+    } else {
+      shown.lat += (target.lat - shown.lat) * 0.3;
+      shown.lon += (target.lon - shown.lon) * 0.3;
+    }
+    if (target.heading != null) {
+      if (!shown.hasHeading) { shown.heading = target.heading; shown.hasHeading = true; }
+      else shown.heading = wrap360(shown.heading + angDiff(target.heading, shown.heading) * 0.25);
+    }
+
+    if (!carMarker) {
+      carMarker = L.marker([shown.lat, shown.lon], { icon: CAR_ICON, interactive: false,
+                                                     zIndexOffset: 1000 }).addTo(map);
+    } else {
+      carMarker.setLatLng([shown.lat, shown.lon]);
+    }
+
+    if (cam.follow && !userZooming && performance.now() > cam.previewUntil) applyCamera();
+
+    var nav = document.getElementById("carnav");
+    if (nav) nav.classList.toggle("no-heading", !shown.hasHeading);
+    turn("carnav", shown.hasHeading ? shown.heading : -map.getBearing());
+    if (latest && latest.ambulance) turn("ambnav", latest.ambulance.heading);
+    var b = map.getBearing();
+    el.compass.hidden = Math.abs(angDiff(b, 0)) < 0.5;
+    el.compassNeedle.style.transform = "rotate(" + b.toFixed(1) + "deg)";
+  }
+  setInterval(tick, 80);                        // ~12 fps: smooth, light on the Pi
+
+  /* ============================================================ search */
+  var searchTimer = null, searchSeq = 0, items = [], active = -1;
+
+  function showNote(text, isError) {
+    el.results.innerHTML = '<div class="note' + (isError ? ' error' : '') + '">'
+      + escapeHtml(text) + '</div>';
+    el.results.hidden = false;
+  }
+  function closeResults() { el.results.hidden = true; el.results.innerHTML = ""; items = []; active = -1; }
+
+  function renderResults(list) {
+    items = list; active = list.length ? 0 : -1;
+    if (!list.length) { showNote("No places found"); return; }
+    el.results.innerHTML = list.map(function (r, i) {
+      return '<div class="result' + (i === active ? ' active' : '') + '" role="option" data-i="' + i + '">'
+        + '<svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C8.1 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3.1-7-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z" fill="currentColor"/></svg>'
+        + '<div style="min-width:0"><div class="name">' + escapeHtml(r.name) + '</div>'
+        + (r.detail ? '<div class="detail">' + escapeHtml(r.detail) + '</div>' : '')
+        + '</div></div>';
+    }).join("");
+    el.results.hidden = false;
+  }
+  function highlight(i) {
+    var rows = el.results.querySelectorAll(".result");
+    if (!rows.length) return;
+    active = (i + rows.length) % rows.length;
+    rows.forEach(function (row, k) { row.classList.toggle("active", k === active); });
+    rows[active].scrollIntoView({ block: "nearest" });
+  }
+
+  function runSearch(q) {
+    var mine = ++searchSeq;
+    showNote("Searching…");
+    fetch("/api/search?q=" + encodeURIComponent(q))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (mine !== searchSeq) return;                  // a newer search won
+        if (d.error) { showNote("Search failed: " + d.error, true); return; }
+        renderResults(d.results || []);
+      })
+      .catch(function () { if (mine === searchSeq) showNote("Search failed - is the Pi online?", true); });
+  }
+
+  el.q.addEventListener("input", function () {
+    var q = el.q.value.trim();
+    el.qclear.hidden = !el.q.value;
+    clearTimeout(searchTimer);
+    if (q.length < 3) { searchSeq++; closeResults(); return; }
+    searchTimer = setTimeout(function () { runSearch(q); }, 300);
+  });
+  el.q.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown") { e.preventDefault(); highlight(active + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); highlight(active - 1); }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      if (items.length && active >= 0) choose(items[active]);
+      else if (el.q.value.trim().length >= 3) { clearTimeout(searchTimer); runSearch(el.q.value.trim()); }
+    } else if (e.key === "Escape") { closeResults(); el.q.blur(); }
+  });
+  el.q.addEventListener("focus", function () { if (items.length) el.results.hidden = false; });
+  el.results.addEventListener("mousedown", function (e) {
+    var row = e.target.closest(".result");
+    if (row) { e.preventDefault(); choose(items[+row.dataset.i]); }
+  });
+  document.addEventListener("mousedown", function (e) {
+    if (!e.target.closest("#search")) el.results.hidden = true;
+  });
+  el.qclear.addEventListener("click", function () {
+    el.q.value = ""; el.qclear.hidden = true; searchSeq++; closeResults(); el.q.focus();
+  });
+
+  function choose(place) {
+    el.q.value = place.name; el.qclear.hidden = false;
+    closeResults(); el.q.blur();
+    setDestination(place.lat, place.lon, place.name);
+  }
+
+  /* ======================================================= destination */
+  function setDestination(lat, lon, name) {
+    showNote("Finding a route to " + (name || "the selected point") + "…");
+    fetch("/api/destination", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lat: lat, lon: lon })
+    }).then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.error) { showNote("Route failed: " + d.error, true); return; }
+        closeResults();
+        drawRoute(d.points || [], d.destination);
+        previewRoute(d.points || []);
+      })
+      .catch(function () { showNote("Route request failed", true); });
+  }
+
+  // Show the whole route north-up for a few seconds, then drop back into
+  // heading-up navigation - the same hand-off Google Maps does.
+  function previewRoute(points) {
+    if (points.length < 2) return;
+    var pts = points.slice();
+    if (shown.lat != null) pts.push([shown.lat, shown.lon]);
+    cam.previewUntil = performance.now() + 4000;
+    cam.headingUp = true; setFollow(true);
+    programmatic = true;
+    map.setBearing(0);
+    map.fitBounds(L.latLngBounds(pts), { padding: [90, 90], maxZoom: 18, animate: false });
+    programmatic = false;
+  }
+
+  // Tap the map to drop a pin, then confirm - avoids re-routing on a stray tap.
+  map.on("click", function (ev) {
+    var btn = L.DomUtil.create("button", "go-here");
+    btn.type = "button"; btn.textContent = "Set destination here";
+    var popup = L.popup({ closeButton: false, offset: [0, -4] })
+      .setLatLng(ev.latlng).setContent(btn).openOn(map);
+    btn.addEventListener("click", function () {
+      map.closePopup(popup);
+      el.q.value = "Dropped pin"; el.qclear.hidden = false;
+      setDestination(ev.latlng.lat, ev.latlng.lng, "the dropped pin");
+    });
+  });
+
+  el.clearbtn.addEventListener("click", function () {
+    fetch("/api/destination/clear", { method: "POST" }).then(function () {
+      clearRoute(); el.q.value = ""; el.qclear.hidden = true;
+    });
+  });
+
+  function drawRoute(points, destination) {
+    if (points.length > 1) {
+      if (!routeLines) {
+        routeLines = [
+          L.polyline(points, { color: "#1A5FD0", weight: 10, opacity: .9,
+                               lineCap: "round", lineJoin: "round", interactive: false }).addTo(map),
+          L.polyline(points, { color: "#4A9EFF", weight: 6, opacity: 1,
+                               lineCap: "round", lineJoin: "round", interactive: false }).addTo(map)
+        ];
+      } else {
+        routeLines.forEach(function (l) { l.setLatLngs(points); });
+      }
+    }
+    if (destination) {
+      if (!destMarker) destMarker = L.marker(destination, { icon: DEST_ICON, zIndexOffset: 900 }).addTo(map);
+      else destMarker.setLatLng(destination);
+    }
+  }
+  function clearRoute() {
+    if (routeLines) { routeLines.forEach(function (l) { map.removeLayer(l); }); routeLines = null; }
+    if (destMarker) { map.removeLayer(destMarker); destMarker = null; }
+  }
+
+  /* ================================================ purple corridor beam */
+  function drawCorridor(points) {
+    if (!points || points.length < 2) {
+      if (corridorLayers) {
+        corridorLayers.forEach(function (l) { map.removeLayer(l); });
+        corridorLayers = null;
+      }
+      return;
+    }
+    if (!corridorLayers) {
+      corridorLayers = [
+        L.polyline(points, { color:"#7C3AED", weight:18, opacity:.25,
+                             lineCap:"round", lineJoin:"round", interactive:false }).addTo(map),
+        L.polyline(points, { color:"#A855F7", weight:10, opacity:.55,
+                             lineCap:"round", lineJoin:"round", interactive:false }).addTo(map),
+        L.polyline(points, { color:"#D8B4FE", weight:3, opacity:.95, interactive:false,
+                             dashArray:"14 14", className:"corridor-core" }).addTo(map)
+      ];
+    } else {
+      corridorLayers.forEach(function (l) { l.setLatLngs(points); });
+    }
+  }
+
+  /* ============================================================ render */
+  function render(s) {
+    latest = s;
+    document.body.dataset.severity = s.alert.severity;
+    el.severity.textContent = SEV[s.alert.severity] || s.alert.severity;
+    el.message.textContent = s.alert.message;
+
+    el.distance.textContent = s.distance_m == null ? "--" : Math.round(s.distance_m);
+    el.speed.textContent = s.ambulance ? s.ambulance.speed_kmh.toFixed(0) : "--";
+    el.ambalt.textContent = s.ambulance ? s.ambulance.altitude_m + " m" : "--";
+
+    if (s.ambulance && s.car.lat != null && s.car.heading != null) {
+      var brg = bearingDeg(s.car.lat, s.car.lon, s.ambulance.lat, s.ambulance.lon);
+      el.needle.style.transform = "rotate(" + ((brg - s.car.heading + 360) % 360).toFixed(1) + "deg)";
+      var dir = s.alert.direction;
+      el.dialCaption.innerHTML = "Ambulance <strong>" + escapeHtml(s.alert.relative) + "</strong>"
+        + (dir !== "UNKNOWN" ? " &middot; you are <strong>" + dir.toLowerCase()
+          + "</strong> to its route" : "");
+    } else {
+      el.dialCaption.textContent = s.passed ? "Ambulance has passed you" : "No bearing yet";
+    }
+
+    flag(el.linkState, s.link.up, "up",
+         s.link.error ? "ERROR: " + s.link.error
+         : s.link.received ? "down (last packet " + Math.round(s.link.age_s) + " s ago)"
+         : "down (nothing received)");
+    el.rxcount.textContent = s.link.received + " + " + s.link.corridor_chunks + " chunks"
+      + (s.link.unknown ? ", " + s.link.unknown + " undecodable" : "");
+    flag(el.gpsState, s.car.fix, "fix", s.car.bench ? "BENCH (faked)" : "no fix");
+    el.sats.textContent = s.car.satellites;
+    el.heading.textContent = s.car.heading == null ? "--" : s.car.heading.toFixed(0);
+    el.headingSrc.textContent = "(" + s.car.heading_source + ")";
+    el.offset.textContent = s.path.offset_m == null ? "--" : s.path.offset_m.toFixed(0);
+    el.mode.textContent = s.path.mode;
+    el.cpts.textContent = s.corridor.points.length;
+    el.loss.textContent = s.link.loss_pct.toFixed(1);
+
+    el.rkm.textContent = s.route.remaining_km == null ? "--" : s.route.remaining_km.toFixed(1) + " km";
+    el.rmin.textContent = s.route.remaining_min == null ? "--" : s.route.remaining_min.toFixed(0) + " min";
+    el.clearbtn.disabled = !s.route.destination;
+
+    updateMap(s);
+  }
+
+  function updateMap(s) {
+    var accent = getComputedStyle(document.body).getPropertyValue("--state").trim();
+
+    // Feed the camera; the tick loop does the smoothing and drawing.
+    if (s.car.lat != null) {
+      target.lat = s.car.lat; target.lon = s.car.lon;
+      if (s.car.heading != null) target.heading = s.car.heading;
+
+      // Trail only while actually moving, so GPS drift at a standstill
+      // doesn't scribble over the map.
+      if (s.car.speed_kmh >= 3) {
+        if (!trail) trail = L.polyline([], { color:"#4A9EFF", weight:3, opacity:.35,
+                                             interactive:false }).addTo(map);
+        var pos = [s.car.lat, s.car.lon], last = trailPts[trailPts.length - 1];
+        if (!last || metres(last, pos) >= TRAIL_MIN_M) {
+          trailPts.push(pos);
+          if (trailPts.length > TRAIL_MAX) trailPts.shift();
+          trail.setLatLngs(trailPts);
+        }
+      }
+    }
+
+    if (s.ambulance) {
+      var amb = [s.ambulance.lat, s.ambulance.lon];
+      if (!ambMarker) {
+        ambMarker = L.marker(amb, { icon: AMB_ICON, interactive: false,
+                                    zIndexOffset: 950 }).addTo(map);
+      } else {
+        ambMarker.setLatLng(amb);
+      }
+    } else if (ambMarker) {
+      map.removeLayer(ambMarker);          // passed you, or out of range
+      ambMarker = null;
+    }
+
+    // Corridor: redraw only when its version changes.
+    if (s.corridor.version !== corridorVersion) {
+      corridorVersion = s.corridor.version;
+      drawCorridor(s.corridor.points);
+    } else if (!s.corridor.points.length) {
+      drawCorridor(null);
+    }
+
+    // Straight-ray overlay only while no corridor has arrived.
+    if (s.path.ray_end && s.ambulance) {
+      var ray = [[s.ambulance.lat, s.ambulance.lon], s.path.ray_end];
+      if (!rayLine) rayLine = L.polyline(ray, { color:accent, weight:4, opacity:.6,
+                                                dashArray:"10 8", interactive:false }).addTo(map);
+      else { rayLine.setLatLngs(ray); rayLine.setStyle({ color:accent }); }
+    } else if (rayLine) { map.removeLayer(rayLine); rayLine = null; }
+
+    // Own route: trimmed by the server as it is consumed.
+    if (s.route.points.length > 1) drawRoute(s.route.points, s.route.destination);
+    else if (!s.route.destination) clearRoute();
+  }
+
+  var stream = new EventSource("/api/stream");
+  stream.onmessage = function (ev) {
+    try { render(JSON.parse(ev.data)); } catch (err) { console.error(err); }
+  };
+  stream.onerror = function () {
+    el.linkState.textContent = "server lost"; el.linkState.className = "off";
+  };
+})();
+</script>
+</body>
+</html>

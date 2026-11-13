@@ -25,7 +25,7 @@ while time.time() - t0 < 15:
     print(f"\r  {n:5d} samples", end="")
     time.sleep(0.01)
 
-bias = {"x": sx / n, "y": sy / n, "z": sz / n}
+bias = {"x": sx / n, "y": sy / n, "z": sz / n} 
 
 with open(config.IMU_CALIB, "w") as f:
     json.dump({"gyro_bias": bias}, f, indent=2)

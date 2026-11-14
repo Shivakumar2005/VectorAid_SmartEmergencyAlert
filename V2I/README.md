@@ -1,266 +1,233 @@
-# V2I ambulance signal pre-emption: ESP32-S3 + nRF24L01+ PA+LNA, Next.js on Vercel, MCP tools
+# Vector Aid V2I: route-aware traffic-signal pre-emption for ambulances
 
-An ambulance unit (OBU) broadcasts a 32-byte packet 10 times a second on nRF24 channel 76 at
-250 kbps. A roadside unit (RSU) at a junction pre-empts its lights **only if the packet names that
-junction as the ambulance's next junction** and the ambulance is within 200 m. The web app runs
-the same rules on a map (mode 1) and shows the boards' state next to the simulation (mode 2).
+**Live demo: [v2i-ambulance.vercel.app](https://v2i-ambulance.vercel.app)**
 
-## What was checked, and what was not
+An ambulance tells the traffic lights ahead of it that it is coming, which way it will turn, and how
+urgent the call is. Only the junctions that are actually on its route react. They end the current
+green safely and give the ambulance's road a green before it arrives, then return to normal once it
+has passed.
 
-Checked in the build environment:
+This folder is the infrastructure side (vehicle-to-infrastructure, V2I) of Vector Aid. The
+[Transmitter](../Transmitter) and [Receiver](../Receiver) folders hold the vehicle-to-vehicle
+system that warns nearby drivers.
 
-- `npm run verify` passed: type check, ESLint with no warnings, 33 tests, production build, and a secret scan of the browser bundle.
-- The S1–S7 scenarios passed, both in the browser and through the MCP server.
-- The roadside unit's C++ logic passed a host test on a laptop:
-  - one green at a time;
-  - yellow and all-red between greens;
-  - off-route ambulances are ignored;
-  - three ambulances are served nearest-first;
-  - the light is released after the 120 s maximum hold.
-- The C++ and TypeScript packet encoders produce identical bytes.
-- Both sketches compile for ESP32-S3 with arduino-esp32 core **2.0.9** and RF24, with no warnings.
-- API routes, exercised against `next start`:
-  - HMAC signing: tampered, replayed and drifting requests are rejected.
-  - SSE stream.
-  - Rate limiting (HTTP 429).
-  - CSP nonce: every script tag carries it, and the browser logged no CSP violations.
+![Map simulation: three ambulances approach the same junction; it serves the nearest first](docs/map-simulation.png)
 
-Not checked here (no access from the build machine):
+## The problem
 
-- Your hardware: radio range, LED wiring, GPS fix.
-- arduino-esp32 **3.x**.
-- Live OpenRouteService and Overpass calls; their fallbacks were tested.
-- Deployment to Vercel.
+An ambulance loses time at every red light. Crossing a red is dangerous, for the crew and for
+traffic that has a green. Simple pre-emption systems react to any emergency vehicle in range, so
+signals near the ambulance change even when it will never pass through them. That disrupts
+traffic for nothing.
 
-## Folder layout
+## What it does
 
+1. **Knows the route.** The start and the hospital are set on real streets from OpenStreetMap. The
+   route follows the street centrelines, and every junction on it is identified. Each junction is
+   classified as a T, a Y, a 4-way or a multi-arm junction. The turn the ambulance will make there
+   (straight, left, right or U-turn) is worked out from the change in heading, Δθ.
+2. **Broadcasts 10 times a second.** The ambulance unit sends a 32-byte radio packet: its position,
+   speed, heading, **the next junction on its route**, the turn there, the hospital and the urgency.
+3. **Only the right junction reacts.** A roadside unit acts when two things are both true: the
+   packet names *it* as the next junction, and the ambulance is within 200 m. Every other unit
+   ignores the packet, even one the ambulance passes right beside.
+4. **Changes the lights safely.** The current green finishes its minimum time, then goes through
+   yellow and all-red before the ambulance's road turns green. There is never more than one green
+   at a time.
+5. **Holds, then lets go.** The green stays until the ambulance is 15 m past the junction, then the
+   normal cycle resumes. The green is released after 2 minutes at most, so a stopped ambulance
+   cannot block the junction.
+6. **Handles several ambulances.** When two or three approach the same junction, it serves them in
+   order of expected arrival, with more urgent calls moved ahead. The one being served keeps the
+   green until it has passed.
+
+```mermaid
+flowchart TB
+  subgraph OBU["Ambulance unit"]
+    GPS["NEO-M8N GPS"] --> TX["ESP32-S3"]
+    TX --> RF1["nRF24L01+ PA+LNA"]
+  end
+  subgraph RSU["Roadside unit, one per junction"]
+    RF2["nRF24L01+ PA+LNA"] --> RX["ESP32-S3 signal controller"]
+    RX --> HEADS["Red / yellow / green per arm"]
+  end
+  RF1 -- "32 bytes, 10 Hz, channel 76, 250 kbps" --> RF2
+  subgraph WEB["Web platform on Vercel"]
+    APP["Map simulation and hardware twin"]
+    API["Routing, road data, signed telemetry, live stream"]
+  end
+  RX -- "USB (Web Serial)" --> APP
+  RX -. "Wi-Fi, signed status" .-> API
+  APP --> API
 ```
-src/app/                    page, layout, API routes (route, roads, telemetry, stream, config, tiles)
-src/middleware.ts           per-request CSP nonce + rate limits
-src/components/             TopTelemetryRibbon, InteractiveV2IMap, PhysicalTrafficSignalHead,
-                            LiveHardwareWebsiteView, WebSerialHardwareBridge, ControlPanel, SidePanel
-src/lib/                    geo, roadGraph (OSM + demo grid), v2iPreemptionEngine, rf24PacketCodec,
-                            scenarios (S1–S7), webSerial, server/ (env, hmac, schemas, store, rateLimit)
-firmware/include/v2i_protocol.h            the packet, CRC-8, geodesy (canonical copy)
-firmware/ambulance_tx_esp32s3/             OBU sketch (+ copy of v2i_protocol.h)
-firmware/roadside_rx_esp32s3/              RSU sketch + v2i_rsu_logic.h (+ copy of v2i_protocol.h)
-mcp-server/v2i-mcp-server.ts               MCP server "v2i-traffic-controller"
-tests/                      vitest suites + firmware_host_test.cpp
+
+## How a junction behaves
+
+```mermaid
+stateDiagram-v2
+  [*] --> Normal
+  Normal --> Clearing: next junction is this one, ambulance within 200 m
+  Clearing --> Held: minimum green, 3 s yellow, 2 s all-red, then green for the ambulance
+  Held --> Recover: ambulance 15 m past, or 120 s maximum hold reached
+  Recover --> Normal: yellow, all-red, normal cycle continues
 ```
 
-## 1. Run it on your laptop (Windows PowerShell)
-
-1. Install Node.js 20 or newer.
-2. In the project folder:
-   ```powershell
-   npm install
-   Copy-Item .env.example .env.local
-   npm run dev
-   ```
-3. Open http://localhost:3000 in **Chrome or Edge**. Web Serial only works there.
-4. Optional: open `.env.local` in an editor and put your OpenRouteService key after `ORS_API_KEY=`.
-   - Never paste the key into code or chat.
-   - Never give it a `NEXT_PUBLIC_` name.
-   - Without a key, routing uses the OpenStreetMap road graph.
-
-### Real roads (OpenStreetMap)
-
-1. Click **OpenStreetMap** in the left panel.
-2. Click **Set the start**, then click your start street. If no roads are loaded there yet, the app loads the streets around that point by itself (5–60 s), then places the pin. Messages appear at the top of the map.
-3. Or load an area yourself: pan, zoom in until the view is about 4 km across or less, and click **Load the roads in view**.
-   - The roads come from public Overpass servers. If the main server (overpass-api.de) is busy, the app tries maps.mail.ru and then overpass.private.coffee by itself.
-   - If all three fail, it says so. Zoom in further, or wait a minute and try again.
-4. Set the hospital on a street (within about 4 km of the start), then **Dispatch**. A roadside unit is placed at every junction on the route.
-5. The **Route with OpenRouteService** box is greyed out until you do both of these:
-   - Put your key in `.env.local`.
-   - Restart `npm run dev`. The server reads `.env.local` only when it starts.
-
-Without the key, routing uses the loaded OpenStreetMap roads, which are the same streets.
-
-## 2. Deploy to Vercel
-
-1. Log in and link the project:
-   ```powershell
-   npx vercel login
-   npx vercel link
-   ```
-2. Add the server-only secrets. Each command prompts for the value, so the value never lands in a file or in your shell history:
-   ```powershell
-   npx vercel env add ORS_API_KEY production
-   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"   # make a telemetry secret
-   npx vercel env add V2I_HMAC_SECRET production
-   ```
-3. Optional: add `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`. Without them, telemetry and rate limits are kept per server instance only. On Vercel that means a board's report may not reach the browser's stream.
-4. Deploy:
-   ```powershell
-   npx vercel --prod
-   ```
-5. Check the security headers:
-   ```powershell
-   curl.exe -sI https://<your-app>.vercel.app/
-   ```
-   The response should include `content-security-policy`, `strict-transport-security`, `x-frame-options: DENY` and `permissions-policy`.
-
-Notes:
-
-- `vercel.json` pins functions to `bom1` (Mumbai).
-- The live stream reconnects about every 55 s. This keeps it within the time limit of every Vercel plan.
-- Cost per Upstash use:
-
-  | Action | Redis commands |
-  |---|---|
-  | Each board report | about 5 |
-  | Each open live view | 1 every 2 s |
-
-  Check these against your Upstash plan.
-
-## 3. Wiring (ESP32-S3-DevKitC-1)
-
-### nRF24L01+ PA+LNA (both boards)
-
-| nRF24 pin | ESP32-S3 | Notes |
-|---|---|---|
-| VCC | 3V3 | Put a 10–100 µF capacitor right at the module. The PA+LNA module draws current peaks; an nRF24 socket adapter with its own 3.3 V regulator is more reliable. |
-| GND | GND | |
-| CE | GPIO 38 | On v1.1 DevKitC boards the on-board RGB LED is also on GPIO 38. It may flicker; that is harmless. |
-| CSN | GPIO 39 | |
-| SCK | GPIO 40 | |
-| MOSI | GPIO 41 | |
-| MISO | GPIO 42 | |
-| IRQ | not connected | |
-
-### NEO-M8N (ambulance board only)
-
-| NEO-M8N pin | ESP32-S3 |
+| Rule | Value |
 |---|---|
-| TX | GPIO 18 |
-| RX | GPIO 17 |
-| VCC | 5V |
-| GND | GND |
+| Normal cycle, per road | 12 s green, 3 s yellow, 2 s all-red |
+| Minimum green before switching | 5 s |
+| Detection distance | 200 m, only for the ambulance's next junction |
+| Released after | the ambulance is 15 m past, or 120 s at most (then a 30 s pause for that ambulance) |
+| Priority between ambulances | expected arrival time, 4 s earlier per urgency level |
+| Roads per junction | up to 5 (3 lamps each, 15 output pins) |
 
-Check that your GPS board has its own regulator before connecting it to 5V. The link runs at 9600 baud.
+In the worst case a junction needs about 10 s to make the ambulance's road green safely: 5 s
+minimum green, 3 s yellow and 2 s all-red. At 40 km/h the ambulance covers about 110 m in that
+time, so a junction that hears it at 200 m is green with roughly 90 m to spare.
 
-### Signal LEDs (roadside board)
+## The web platform
 
-Each GPIO drives one LED through a 220–330 Ω resistor to GND.
+The demo has two views that share one live simulation.
 
-| Arm | Red | Yellow | Green |
-|---|---|---|---|
-| 0 | 4 | 5 | 6 |
-| 1 | 7 | 15 | 16 |
-| 2 | 17 | 18 | 8 |
-| 3 | 9 | 10 | 11 |
-| 4 | 12 | 13 | 14 |
+**Map simulation:**
 
-Arm numbers follow the order the web app lists them (shown under each signal head in the hardware twin). Send `TEST` over serial to light every LED once, in order.
+- Choose the offline demo street grid, or real OpenStreetMap streets for any area up to about 4 km
+  across.
+- Set an ambulance start and a hospital and dispatch it. A roadside unit appears at every junction
+  on the route.
+- Drop extra traffic lights by hand; each one snaps to the nearest junction.
+- Add civilian traffic (18, 36 or 60 cars) that queues at red lights.
+- Watch each junction's lights, the 200 m detection circles, the queues and a live event log.
+- Run seven ready-made scenarios, and verify all of them with one click.
 
-## 4. Flash the boards (Arduino IDE 2)
+**Hardware twin:**
 
-1. Boards Manager: install **esp32 by Espressif**. Library Manager: install **RF24 by TMRh20**.
-2. Tools → Board: **ESP32S3 Dev Module**. Plug in the board's **UART** USB port and leave "USB CDC On Boot" **Disabled**.
-3. Open `firmware/roadside_rx_esp32s3/roadside_rx_esp32s3.ino` and upload it to the roadside board.
-4. Open `firmware/ambulance_tx_esp32s3/ambulance_tx_esp32s3.ino` and upload it to the ambulance board (only needed for two-board mode).
-5. If you edit `firmware/include/v2i_protocol.h`, run `npm run sync:firmware` to copy it into both sketches. A test fails if the copies differ.
+- The ambulance unit's live readings: speed, heading, GPS, progress and the next turn.
+- The exact 32 bytes it transmits, with each field labelled.
+- The roadside unit's signal heads for every road, with the level of each output pin.
+- Real boards connect over USB in Chrome or Edge, and their lights are shown next to the
+  simulation's.
 
-A roadside board that has not been configured flashes yellow. Its configuration comes from the web app and is saved in flash.
+![Hardware twin: the transmitted packet, and the roadside unit's signal heads with their pin levels](docs/hardware-twin.png)
 
-## 5. Use the boards with the web app
+### Try the demo
 
-1. In the web app, open **Hardware twin**.
-2. Choose which junction the roadside board acts as. **Connect** it and pick its serial port. The page sends `CFG,...`, and the board now runs that junction's lights itself.
-3. Choose how the board gets the ambulance:
-   - **One board:** the page sends every simulated ambulance's packet to the roadside board over USB (`PKT,<hex>`). No radio is used.
-   - **Two boards:** also **Connect** the ambulance board and choose which ambulance it follows. The page feeds it position (`SIM,...`) and the route's junctions. It transmits by nRF24 and the roadside board receives it.
-4. Dispatch an ambulance or run a scenario on the map. The twin shows:
-   - the board's lamps next to the simulation's;
-   - the 32 transmitted bytes, with any differing bytes underlined.
+- In **Scenarios**, run **S6: 3 Ambulances Priority** and watch the junction serve the nearest ambulance first.
+- Switch to **Hardware twin** to see the radio packet and the signal heads change.
+- Switch the map to **OpenStreetMap**, click **Set the start**, then click a street in your city. Its streets load first; this can take up to a minute.
 
-The board runs its own clock, so in the normal cycle its phase can differ from the simulation. During a pre-emption both serve the same arm.
+The map simulation runs in any modern browser. Connecting real boards needs Chrome or Edge on a
+desktop.
 
-### Optional: Wi-Fi uplink from the roadside board
+## Scenarios
 
-1. Open the Arduino Serial Monitor at 115200 baud with "Newline" line endings. Type these commands one at a time, never into a web page:
-   ```
-   WIFI,<ssid>,<password>
-   SECRET,<the same V2I_HMAC_SECRET as on Vercel>
-   URL,https://<your-app>.vercel.app/api/v2i/telemetry
-   UPLINK,1,5
-   ```
-   `UPLINK,1,5` posts every 5 s. `UPLINK,0` stops posting.
-2. The board signs each report: HMAC-SHA256 of `timestamp.sequence.body`, using NTP time. The sequence keeps increasing across reboots.
-3. In the hardware twin, turn on **Units reporting over Wi-Fi > Live** to see the reports.
+Each scenario runs on its own and checks the safety rules automatically.
 
-## 6. MCP tools for Claude
-
-`.mcp.json` defines three servers:
-
-| Server | What it is |
+| Scenario | What it shows |
 |---|---|
-| `v2i-traffic-controller` | This project's local server, run with `npx tsx mcp-server/v2i-mcp-server.ts` |
-| `vercel` | https://mcp.vercel.com (OAuth, authorize with `/mcp`) |
-| `github` | https://api.githubcopilot.com/mcp, using a token from the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable |
+| S1: Normal cycle | Every road at every junction gets its green; nothing is pre-empted without an ambulance |
+| S2: Single ambulance | Green on arrival at each junction along a straight run; nearby junctions off the route stay unaffected |
+| S3: 4-way left turn | The turn is classified LEFT and the correct road is given green |
+| S4: T-junction right turn | Topology classified as a T-junction, turn as RIGHT |
+| S5: 4-way straight | Straight through a crossroad |
+| S6: 3 ambulances | Three ambulances at 180, 120 and 75 m are served nearest first |
+| S7: Multi-junction wave | A green wave along a corridor with a turn in the middle |
 
-Tools in `v2i-traffic-controller`:
+Every scenario checks the safety rules:
 
-- `v2i_dispatch_ambulance`
-- `v2i_drop_traffic_light_pin`
-- `v2i_inspect_junction_signals`
-- `v2i_encode_decode_rf24_packet`
-- `v2i_run_scenario_verification` (0 runs S1–S7)
-- `v2i_reset_simulation`
+- never two greens at once;
+- a green always ends in yellow, then all-red;
+- no junction off the route ever reacts.
 
-They run on the demo grid, offline, with no keys.
+All seven pass, both on the demo grid and on a dense test city of about 6,600 road segments.
 
-To set it up:
+## The radio packet
 
-```powershell
-$env:GITHUB_PERSONAL_ACCESS_TOKEN = "<your token>"   # set it in your shell, never in .mcp.json
-claude                                               # in the project folder; approve the project servers
+32 bytes, little-endian, the same in the firmware (C++) and the web app (TypeScript).
+
+| Bytes | Field |
+|---|---|
+| 0 | Start marker, 0xA5 |
+| 1 | Ambulance number (101 means AMB-101) |
+| 2–9 | Current latitude and longitude, degrees × 10⁷ |
+| 10–11 | Heading, tenths of a degree |
+| 12–13 | Speed, tenths of a km/h |
+| 14–21 | Next junction on the route (latitude, longitude) |
+| 22–29 | Hospital (latitude, longitude) |
+| 30 | Turn at the next junction (low 4 bits) and urgency, 0 to 3 (high 4 bits) |
+| 31 | CRC-8 checksum |
+
+A packet with a bad checksum, an impossible position or a speed above 200 km/h is rejected.
+
+## Hardware
+
+| Unit | Parts |
+|---|---|
+| Ambulance unit | ESP32-S3-DevKitC-1, u-blox NEO-M8N GPS, nRF24L01+ PA+LNA radio |
+| Roadside unit | ESP32-S3-DevKitC-1, nRF24L01+ PA+LNA radio, red/yellow/green LEDs for up to 5 roads |
+
+A roadside unit can also report its state over Wi-Fi to the web platform. Each report is signed
+(HMAC-SHA256) and timestamped, so it cannot be forged or replayed.
+
+## Built with
+
+| Area | Technology |
+|---|---|
+| Firmware | ESP32-S3 (Arduino), RF24 |
+| Web | Next.js, React, TypeScript, Leaflet, Tailwind CSS |
+| Maps and routing | OpenStreetMap (via Overpass), openrouteservice |
+| Hosting | Vercel |
+| Testing | Vitest; the roadside unit's C++ logic is also tested on a PC |
+| AI tools | Model Context Protocol server: Claude can dispatch ambulances, read signal states, decode packets and run the scenarios |
+
+**Security:**
+
+- API keys stay on the server.
+- Every page carries a strict content security policy.
+- Board reports are signed (HMAC-SHA256), checked against the server clock and protected against replay.
+- Every API is rate-limited.
+
+## Status
+
+**Working now:**
+
+- The live web platform, the simulation and all seven scenarios.
+- Firmware for both units. It compiles for the ESP32-S3. The roadside unit's decision logic, the
+  same C++ that runs on the board, passes safety tests on a PC: one green at a time, yellow and
+  all-red between greens, off-route ambulances ignored, nearest ambulance first, and release after
+  the maximum hold.
+
+**In progress:**
+
+- Bench and on-road trials with the radios: range, packet loss at speed, several junctions in a row.
+
+This is a research prototype that drives LEDs. It is not a certified traffic-signal controller.
+
+## What's next
+
+- **Field trials:** measure radio range and reliability on real roads at ambulance speeds.
+- **One broadcast for vehicles and signals:** the same ambulance message serves both nearby
+  drivers (the V2V receivers in this repository) and roadside units.
+- **Arrival-time prediction:** learn from logged runs so junctions start clearing earlier on fast or
+  congested roads.
+- **Stronger device security:** a separate signing key per roadside unit, and certificate checking
+  on the boards.
+- **Real signal hardware:** drive an actual controller's pre-emption input through an isolated
+  output instead of LEDs, with independent conflict monitoring.
+
+## Folder contents
+
+```
+V2I/
+├── src/          web platform: simulation engine, map, hardware twin, API
+├── firmware/     ESP32-S3 programs: ambulance transmitter, roadside receiver and signal controller
+├── mcp-server/   tools that let an AI assistant drive and inspect the simulation
+├── tests/        simulation, packet, firmware-logic and tool tests
+├── docs/         screenshots
+└── SETUP.md      build, wiring, flashing and deployment notes for developers
 ```
 
-On native Windows, if `npx` fails to start the local server, change its entry to `"command": "cmd", "args": ["/c", "npx", "tsx", "mcp-server/v2i-mcp-server.ts"]`.
+Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors. Routing by
+[openrouteservice](https://openrouteservice.org).
 
-## 7. Tests
-
-```powershell
-npm run verify          # typecheck + lint + tests + production build + secret scan
-npm run test:firmware   # RSU C++ logic on the laptop (needs g++; MinGW on Windows)
-```
-
-## Security model, and its limits
-
-Enforced:
-
-- **Secrets:**
-  - Secrets are read only in `src/lib/server/env.ts`, which is marked `server-only`.
-  - `scripts/scan-secrets.mjs` fails the build check if a secret value, a secret variable's name, or an OpenRouteService-shaped key appears in `.next/static` or in the source.
-- **Telemetry:**
-  - Signed with HMAC-SHA256 and checked in constant time.
-  - Clock drift of more than 10 s is rejected.
-  - Each device's sequence number must increase, which blocks replays.
-  - The body is validated with zod and limited to 8 KB.
-  - Telemetry is refused when the secret is shorter than 32 characters.
-- **Routing proxy:**
-  - Requests from other sites are refused.
-  - The OpenRouteService key stays on the server.
-  - OpenRouteService error bodies are never forwarded.
-- **Headers:**
-  - Per-request CSP nonce with `strict-dynamic`.
-  - HSTS (2 years, preload), nosniff, `X-Frame-Options: DENY`.
-  - `Permissions-Policy: serial=(self), geolocation=(self)`.
-- **Rate limits:** per IP on every `/api` route.
-
-Limits you should know:
-
-- **One shared telemetry secret:** all roadside boards use it, so one compromised board can impersonate the others. Per-device keys would be the next step.
-- **Board certificate check:** the board does not verify the server's certificate unless you paste a root CA into `ROOT_CA_PEM`. Without it, nobody can forge or replay reports, but someone on the network path could read them.
-- **Rate limiter fails open:** if Upstash is unreachable, requests are let through rather than taking the site down.
-- **`style-src 'unsafe-inline'`:** kept because Leaflet and React set inline styles. Scripts stay strict.
-- **Map tiles:** they load straight from tile.openstreetmap.org, which is what the OSM tile policy expects. The `/api/tiles` proxy is off unless you set `TILE_PROXY_CONTACT`, because that policy discourages proxies and requires a contactable User-Agent.
-- **Not a certified controller:** this is a demonstrator, not a certified traffic controller. Real cabinets enforce conflict monitoring in independent hardware.
-
-## Things that are deliberately different from the original prompt
-
-- **Byte 31 is a CRC-8 only.** One byte cannot also carry a sequence number.
-- **Bengaluru road graph:** the hand-typed "verified" graph from the earlier HTML is not used. Real roads come from OpenStreetMap at runtime ("Load the roads in view"). Offline, the app uses a labelled synthetic demo grid.
-- **Green timing:** pre-emption honours a 5 s minimum green, then 3 s yellow and 2 s all-red. Green therefore comes about 10 s after detection, which is about 110 m at 40 km/h. An ambulance first detected closer than that waits briefly. The host test shows it: at 75 m and 36 km/h the ambulance waits 4 s.
+Built by Team Vector Aid.

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "v2i-traffic-controller": {
+      "command": "npx",
+      "args": ["tsx", "mcp-server/v2i-mcp-server.ts"]
+    },
+    "vercel": {
+      "type": "http",
+      "url": "https://mcp.vercel.com"
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp",
+      "headers": { "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}" }
+    }
+  }
+}
